@@ -1,7 +1,10 @@
 use std::iter::Peekable;
+use std::env;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag};
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Default, PartialEq)]
 struct Node {
@@ -18,7 +21,7 @@ impl Node {
     fn append(&mut self, mut nodes: Vec<Node>) {
         match &mut self.children {
             Some(children) => children.append(&mut nodes),
-            None => self.children = Some(nodes),
+            children @ None => *children = Some(nodes),
         }
     }
 }
@@ -124,7 +127,100 @@ fn parse(url: &str) -> Result<Vec<Node>> {
     Ok(sections)
 }
 
-fn print_tree(indent: u32, sections: Vec<Node>) {
+fn print_tree(indent: u32, mut sections: Vec<FilteredNode>) {
+    sections.sort_by_key(|n| match n {
+        FilteredNode::Section { .. } => std::u64::MAX,
+        FilteredNode::Item { stars, .. } => stars.unwrap_or(0),
+    });
+    sections.reverse();
+
+    for node in sections.into_iter().take(10) {
+        println!(
+            "{:4$}{}: {}; stars = {:?}",
+            "",
+            node.title(),
+            node.url().unwrap_or(""),
+            node.stars(),
+            indent as usize
+        );
+
+        if let FilteredNode::Section { children, .. } = node {
+            print_tree(indent + 4, children);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum FilteredNode {
+    Section {
+        title: String,
+        url: Option<String>,
+        children: Vec<FilteredNode>,
+    },
+    Item {
+        title: String,
+        url: String,
+        stars: Option<u64>,
+    },
+}
+
+impl FilteredNode {
+    fn title(&self) -> &str {
+        match self {
+            Self::Section { title, .. } => &title,
+            Self::Item { title, .. } => &title,
+        }
+    }
+
+    fn url(&self) -> Option<&str> {
+        match self {
+            Self::Section { url, .. } => url.as_ref().map(|s| s.as_str()),
+            Self::Item { url, .. } => Some(&url),
+        }
+    }
+
+    fn stars(&self) -> Option<u64> {
+        match self {
+            Self::Item { stars, .. } => *stars,
+            _ => None,
+        }
+    }
+}
+
+fn get_client() -> Result<reqwest::blocking::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("token {}", env::var("GITHUB_TOKEN")?).parse()?,
+    );
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:77.0) Gecko/20100101 Firefox/77.0"
+            .parse()?,
+    );
+    let client = reqwest::blocking::Client::builder()
+        .default_headers(headers)
+        .build()?;
+    Ok(client)
+}
+
+fn get_stars(client: &reqwest::blocking::Client, url: &str) -> Result<u64> {
+    let mut split = url.rsplit('/');
+    let repo = split.next().unwrap();
+    let owner = split.next().unwrap();
+    let api = format!("https://api.github.com/repos/{}/{}", owner, repo);
+    eprintln!("GET {}", api);
+    let resp: serde_json::Value = client.get(&api).send()?.error_for_status()?.json()?;
+    let stars = resp.get("stargazers_count").unwrap().as_u64().unwrap();
+    Ok(stars)
+}
+
+fn filtered_nodes(
+    client: &reqwest::blocking::Client,
+    sections: Vec<Node>,
+) -> Result<Vec<FilteredNode>> {
+    let mut filtered = Vec::new();
+
     for node in sections {
         let Node {
             title,
@@ -132,24 +228,50 @@ fn print_tree(indent: u32, sections: Vec<Node>) {
             children,
         } = node;
 
-        println!(
-            "{:3$}{}: {}",
-            "",
-            title,
-            url.unwrap_or(String::from("")),
-            indent as usize
-        );
+        let children = match children {
+            Some(children) => {
+                let filtered_children = filtered_nodes(client, children)?;
+                if filtered_children.len() == 0 {
+                    None
+                } else {
+                    Some(filtered_children)
+                }
+            }
+            None => None,
+        };
 
-        if let Some(children) = children {
-            print_tree(indent + 4, children);
+        if children.is_some()
+            || url
+                .as_ref()
+                .map(|s| s.contains("github.com"))
+                .unwrap_or(false)
+        {
+            filtered.push(match children {
+                Some(children) => FilteredNode::Section {
+                    title,
+                    url,
+                    children,
+                },
+                None => {
+                    let url = url.unwrap();
+                    let stars = get_stars(client, &url).ok();
+                    FilteredNode::Item { title, url, stars }
+                }
+            });
         }
     }
+
+    Ok(filtered)
 }
 
 fn main() -> Result<()> {
-    let url = "https://github.com/unixorn/awesome-zsh-plugins/raw/master/README.md";
-    let sections = parse(url)?;
-    print_tree(0, sections);
+    let args: Vec<String> = env::args().collect();
+    let url = &args[1];
+    eprintln!("URL: {}", url);
+    let sections = parse(url).context("failed to parse URL contents")?;
+    let client = get_client().context("failed to build HTTP client")?;
+    let filtered = filtered_nodes(&client, sections).context("failed to filter nodes")?;
+    print_tree(1, filtered);
     Ok(())
 }
 
@@ -198,6 +320,4 @@ mod tests {
             }],
         );
     }
-
-    fn with_links() {}
 }
