@@ -1,15 +1,16 @@
-use std::iter::Peekable;
 use std::env;
+use std::iter::Peekable;
 
 use anyhow::{Context, Result};
 use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag};
 use serde::Deserialize;
 use serde::Serialize;
+use url::Url;
 
 #[derive(Debug, Default, PartialEq)]
 struct Node {
     title: String,
-    url: Option<String>,
+    url: Option<Url>,
     children: Option<Vec<Node>>,
 }
 
@@ -32,17 +33,22 @@ fn into_sections(current_level: u32, mut parser: &mut Peekable<Parser>) -> Vec<N
     loop {
         match parser.peek() {
             Some(Event::Start(Tag::Heading(level))) => {
+                // going back to a bigger heading
                 if *level < current_level {
-                    // going back to a bigger heading
                     break;
+                // going to a smaller heading (need to recurse immediately)
                 } else if *level > current_level {
-                    // going to a smaller heading (need to recurse immediately)
-                    match sections.last_mut() {
-                        Some(section) => {
-                            section.append(into_sections(current_level + 1, &mut parser));
-                        }
-                        None => todo!(),
+                    // This can happen if we jump heading levels, so create an implicit section
+                    // for it.
+                    if sections.len() == 0 {
+                        sections.push(Node {
+                            title: "(implicit)".to_string(),
+                            url: None,
+                            children: None,
+                        })
                     }
+                    let section = sections.last_mut().unwrap();
+                    section.append(into_sections(current_level + 1, &mut parser));
                     continue;
                 } else {
                     // consume this heading
@@ -54,9 +60,9 @@ fn into_sections(current_level: u32, mut parser: &mut Peekable<Parser>) -> Vec<N
                                 Some(Event::Text(title)) => title.clone().into_string(),
                                 _ => title.to_string(),
                             };
-                            (title, Some(link.into_string()))
+                            (title, Url::parse(&link).ok())
                         }
-                        _ => todo!(),
+                        event => todo!("heading with event: {:?}", event),
                     };
 
                     // consume until end tag
@@ -84,7 +90,7 @@ fn into_sections(current_level: u32, mut parser: &mut Peekable<Parser>) -> Vec<N
                             Some(Event::Text(title)) => title.clone().into_string(),
                             _ => title.to_string(),
                         };
-                        (title, Some(link.into_string()))
+                        (title, Url::parse(&link).ok())
                     }
                     _ => continue,
                 };
@@ -106,7 +112,7 @@ fn into_sections(current_level: u32, mut parser: &mut Peekable<Parser>) -> Vec<N
                             children: None,
                         });
                     }
-                    None => todo!(),
+                    None => todo!("tag without previous section"),
                 }
             }
             Some(_) => {
@@ -120,7 +126,7 @@ fn into_sections(current_level: u32, mut parser: &mut Peekable<Parser>) -> Vec<N
     sections
 }
 
-fn parse(url: &str) -> Result<Vec<Node>> {
+fn parse(url: Url) -> Result<Vec<Node>> {
     let contents = reqwest::blocking::get(url)?.error_for_status()?.text()?;
     let mut parser = Parser::new(&contents).peekable();
     let sections = into_sections(1, &mut parser);
@@ -135,15 +141,11 @@ fn print_tree(indent: u32, mut sections: Vec<FilteredNode>) {
     sections.reverse();
 
     for node in sections.into_iter().take(10) {
-        println!(
-            "{:4$}{}: {}; stars = {:?}",
-            "",
-            node.title(),
-            node.url().unwrap_or(""),
-            node.stars(),
-            indent as usize
-        );
-
+        let stars = match node.stars() {
+            Some(stars) => format!(" {} ★ {}", node.url().unwrap(), stars),
+            None => String::new(),
+        };
+        println!("{:3$}{}:{}", "", node.title(), stars, indent as usize);
         if let FilteredNode::Section { children, .. } = node {
             print_tree(indent + 4, children);
         }
@@ -154,12 +156,12 @@ fn print_tree(indent: u32, mut sections: Vec<FilteredNode>) {
 enum FilteredNode {
     Section {
         title: String,
-        url: Option<String>,
+        url: Option<Url>,
         children: Vec<FilteredNode>,
     },
     Item {
         title: String,
-        url: String,
+        url: Url,
         stars: Option<u64>,
     },
 }
@@ -172,9 +174,9 @@ impl FilteredNode {
         }
     }
 
-    fn url(&self) -> Option<&str> {
+    fn url(&self) -> Option<&Url> {
         match self {
-            Self::Section { url, .. } => url.as_ref().map(|s| s.as_str()),
+            Self::Section { url, .. } => url.as_ref(),
             Self::Item { url, .. } => Some(&url),
         }
     }
@@ -204,8 +206,8 @@ fn get_client() -> Result<reqwest::blocking::Client> {
     Ok(client)
 }
 
-fn get_stars(client: &reqwest::blocking::Client, url: &str) -> Result<u64> {
-    let mut split = url.rsplit('/');
+fn get_stars(client: &reqwest::blocking::Client, url: &Url) -> Result<u64> {
+    let mut split = url.path().rsplit('/');
     let repo = split.next().unwrap();
     let owner = split.next().unwrap();
     let api = format!("https://api.github.com/repos/{}/{}", owner, repo);
@@ -243,7 +245,7 @@ fn filtered_nodes(
         if children.is_some()
             || url
                 .as_ref()
-                .map(|s| s.contains("github.com"))
+                .and_then(|u| u.host_str().map(|s| s.ends_with("github.com")))
                 .unwrap_or(false)
         {
             filtered.push(match children {
@@ -266,7 +268,7 @@ fn filtered_nodes(
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let url = &args[1];
+    let url = Url::parse(&args[1])?;
     eprintln!("URL: {}", url);
     let sections = parse(url).context("failed to parse URL contents")?;
     let client = get_client().context("failed to build HTTP client")?;
