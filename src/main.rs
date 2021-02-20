@@ -1,7 +1,12 @@
+use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::io;
 use std::iter::Peekable;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
 use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag};
 use serde::Deserialize;
 use serde::Serialize;
@@ -140,7 +145,7 @@ fn print_tree(indent: u32, mut sections: Vec<FilteredNode>) {
     });
     sections.reverse();
 
-    for node in sections.into_iter().take(10) {
+    for node in sections.into_iter() {
         let stars = match node.stars() {
             Some(stars) => format!(" {} ★ {}", node.url().unwrap(), stars),
             None => String::new(),
@@ -206,15 +211,39 @@ fn get_client() -> Result<reqwest::blocking::Client> {
     Ok(client)
 }
 
+static CACHE: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(|| match fs::read("cached.json") {
+    Ok(data) => Mutex::new(serde_json::from_slice(&data).unwrap()),
+    Err(err) if err.kind() == io::ErrorKind::NotFound => Default::default(),
+    Err(err) => panic!("Error: {}", err),
+});
+
+fn get_cached(key: &str) -> Option<u64> {
+    CACHE.lock().unwrap().get(key).copied()
+}
+
+fn set_cached(key: String, stars: u64) {
+    let mut map = CACHE.lock().unwrap();
+    map.insert(key, stars);
+    let serialized = serde_json::to_string(&*map).unwrap();
+    fs::write("cached.json", serialized).unwrap();
+}
+
 fn get_stars(client: &reqwest::blocking::Client, url: &Url) -> Result<u64> {
     let mut split = url.path().rsplit('/');
     let repo = split.next().unwrap();
     let owner = split.next().unwrap();
-    let api = format!("https://api.github.com/repos/{}/{}", owner, repo);
-    eprintln!("GET {}", api);
-    let resp: serde_json::Value = client.get(&api).send()?.error_for_status()?.json()?;
-    let stars = resp.get("stargazers_count").unwrap().as_u64().unwrap();
-    Ok(stars)
+    let key = format!("{}/{}", owner, repo);
+    let api = format!("https://api.github.com/repos/{}", &key);
+    if let Some(stars) = get_cached(&key) {
+        eprintln!("CACHED {}", &key);
+        Ok(stars)
+    } else {
+        eprintln!("GET {}", api);
+        let resp: serde_json::Value = client.get(&api).send()?.error_for_status()?.json()?;
+        let stars = resp.get("stargazers_count").unwrap().as_u64().unwrap();
+        set_cached(key, stars);
+        Ok(stars)
+    }
 }
 
 fn filtered_nodes(
